@@ -40,7 +40,9 @@ pub mod err {
 }
 
 mod utils {
-    
+
+    use std::convert::TryInto;
+
     #[cfg(feature = "bincode")]
     pub fn serialize<T: ?Sized + serde::Serialize>(value: &T) -> crate::err::Result<Vec<u8>> {
         Ok(bincode::serialize(value)?)
@@ -54,16 +56,22 @@ mod utils {
     pub fn u64_to_bytes(value: u64) -> [u8; 8] {
         u64::to_be_bytes(value)
     }
+
+    pub fn bytes_to_u64(value: &[u8]) -> crate::err::Result<u64> {
+        Ok(u64::from_be_bytes(value.try_into().map_err(crate::err::custom)?))
+    }
 }
 
-use std::marker::PhantomData;
+pub mod query;
+
 use sled::transaction::Transactional;
+use std::marker::PhantomData;
 
 pub struct Store<T> {
-    db: sled::Db,
-    tree: sled::Tree,
-    meta: sled::Tree,
-    marker: PhantomData<fn(T)>,
+    pub db: sled::Db,
+    pub tree: sled::Tree,
+    pub meta: sled::Tree,
+    pub marker: PhantomData<fn(T)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,16 +79,6 @@ pub struct Object<T> {
     pub id: u64,
     pub inner: T,
 }
-
-// impl<T: Storable> Object<T> {
-//     fn query_terms(&self) -> Vec<Vec<u8>> {
-//         self.inner.query_terms()
-//             .into_iter()
-//             .map(|t| t.flatten(self.id) )
-//             .collect()
-//     }
-// }
-
 
 impl<T> std::ops::Deref for Object<T> {
     type Target = T;
@@ -96,58 +94,111 @@ impl<T> std::ops::DerefMut for Object<T> {
     }
 }
 
-pub struct QueryTerm<'a> {
-    key: &'a [u8],
-    val: &'a [u8],
-}
-
-impl<'a> QueryTerm<'a> {
-    pub fn flatten(self, id: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.key.len() + self.val.len() + 8);
-        out.extend(self.key);
-        out.extend(self.val);
-        out.extend(&utils::u64_to_bytes(id));
-        out
-    }
-}
-
-pub trait Storable: serde::Serialize + serde::de::DeserializeOwned {
-    fn query_terms(&self) -> Vec<QueryTerm>;
-}
-
-impl<T: Storable> Store<T> {
+impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store<T> {
     pub fn create(&self, inner: &T) -> err::Result<u64> {
         let id = self.db.generate_id()?;
 
-        (&self.tree, &self.meta).transaction(|(tree, meta)| {
+        &[&self.tree, &self.meta].transaction(|trees| {
+            let id_bytes = utils::u64_to_bytes(id);
+
+            let tree = &trees[0];
+            let meta = &trees[1];
+
             let serialized_inner = utils::serialize(inner)?;
 
-            let query_terms = inner.query_terms()
-                .into_iter()
-                .map(|t| t.flatten(id) )
-                .collect::<Vec<_>>();
+            let new_terms =
+                inner.query_terms().into_iter().map(|t| t.flatten_with_id(id)).collect::<Vec<_>>();
 
-            let serialized_query_terms = utils::serialize(&query_terms)?;
+            let serialized_new_terms = utils::serialize(&new_terms)?;
 
-            tree.insert(&id.to_le_bytes(), serialized_inner)?;
+            tree.insert(&id_bytes, serialized_inner)?;
 
-            // meta.insert(b"")
+            meta.insert(
+                query::TERMS_PREFIX.into_iter().chain(&id_bytes).copied().collect::<Vec<_>>(),
+                serialized_new_terms,
+            )?;
+
+            for term in new_terms {
+                meta.insert(term, sled::IVec::default())?;
+            }
 
             Ok(())
-
-        }).map_err(|_| err::custom("Transaction error"))?;
+        })?;
 
         Ok(id)
     }
-}
 
-
-
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    pub fn update(&self, object: &Object<T>) -> err::Result<()> {
+        self.update_multi(std::slice::from_ref(object))
     }
+
+    pub fn update_multi(&self, objects: &[Object<T>]) -> err::Result<()> {
+        &[&self.tree, &self.meta].transaction(|trees| {
+            let tree = &trees[0];
+            let meta = &trees[1];
+
+            for Object { id, inner } in objects {
+
+                let id_bytes = utils::u64_to_bytes(*id);
+
+                let serialized_inner = utils::serialize(inner)?;
+
+                let new_terms =
+                    inner.query_terms().into_iter().map(|t| t.flatten_with_id(*id)).collect::<Vec<_>>();
+
+                let serialized_new_terms = utils::serialize(&new_terms)?;
+
+                let mut batch = sled::Batch::default();
+
+                if let Some(serialized_prev_terms) = meta.insert(
+                    query::TERMS_PREFIX.into_iter().chain(&id_bytes).copied().collect::<Vec<_>>(),
+                    serialized_new_terms,
+                )? {
+                    let prev_terms: Vec<Vec<u8>> = utils::deserialize(&serialized_prev_terms)?;
+                    for term in prev_terms {
+                        batch.remove(term);
+                    }
+                }
+
+                for term in new_terms {
+                    batch.insert(term, sled::IVec::default());
+                }
+
+                meta.apply_batch(&batch)?;
+            }
+
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn all(&self) -> err::Result<Vec<Object<T>>> {
+        
+        Ok(self
+            .tree
+            .iter()
+            .flatten()
+            .map(|(k, v)| {
+                Ok(Object {
+                    id: utils::bytes_to_u64(k.as_ref())?,
+                    inner: utils::deserialize(&v)?,
+                })
+            })
+            .collect::<err::Result<Vec<_>>>()?)
+    }
+
+    pub fn find(&self, id: u64) -> err::Result<Option<Object<T>>> {
+        Ok(self
+            .tree
+            .get(utils::u64_to_bytes(id))?
+            .map(|bytes| utils::deserialize(&bytes))
+            .transpose()?
+            .map(|inner| Object { id, inner }))
+    }
+
+    pub fn filter<Q: query::Query>(&self, query: Q) -> err::Result<query::Results<T>> {
+        let matching_ids = query.matching_ids(self)?;
+        Ok(query::Results { matching_ids, store: self })
+    }
+
 }
