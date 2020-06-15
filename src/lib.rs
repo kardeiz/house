@@ -96,9 +96,10 @@ impl<T> std::ops::DerefMut for Object<T> {
 
 impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store<T> {
     pub fn create(&self, inner: &T) -> err::Result<u64> {
-        let id = self.db.generate_id()?;
 
-        &[&self.tree, &self.meta].transaction(|trees| {
+        let id = [&self.tree, &self.meta].transaction(|trees| {
+            let id = self.db.generate_id()?;
+
             let id_bytes = utils::u64_to_bytes(id);
 
             let tree = &trees[0];
@@ -122,10 +123,49 @@ impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store
                 meta.insert(term, sled::IVec::default())?;
             }
 
-            Ok(())
+            Ok(id)
         })?;
 
         Ok(id)
+    }
+
+    pub fn create_multi(&self, inners: &[T]) -> err::Result<Vec<u64>> {
+        let ids = [&self.tree, &self.meta].transaction(|trees| {
+            
+            let tree = &trees[0];
+            let meta = &trees[1];
+            
+            let mut ids = Vec::with_capacity(inners.len());
+
+            for inner in inners {
+                let id = self.db.generate_id()?;
+
+                let id_bytes = utils::u64_to_bytes(id);
+                let serialized_inner = utils::serialize(inner)?;
+
+                let new_terms =
+                    inner.query_terms().into_iter().map(|t| t.flatten_with_id(id)).collect::<Vec<_>>();
+
+                let serialized_new_terms = utils::serialize(&new_terms)?;
+
+                tree.insert(&id_bytes, serialized_inner)?;
+
+                meta.insert(
+                    query::TERMS_PREFIX.into_iter().chain(&id_bytes).copied().collect::<Vec<_>>(),
+                    serialized_new_terms,
+                )?;
+
+                for term in new_terms {
+                    meta.insert(term, sled::IVec::default())?;
+                }
+
+                ids.push(id);
+            }
+
+            Ok(ids)
+        })?;
+
+        Ok(ids)
     }
 
     pub fn update(&self, object: &Object<T>) -> err::Result<()> {
@@ -133,7 +173,7 @@ impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store
     }
 
     pub fn update_multi(&self, objects: &[Object<T>]) -> err::Result<()> {
-        &[&self.tree, &self.meta].transaction(|trees| {
+        [&self.tree, &self.meta].transaction(|trees| {
             let tree = &trees[0];
             let meta = &trees[1];
 
@@ -147,6 +187,8 @@ impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store
                     inner.query_terms().into_iter().map(|t| t.flatten_with_id(*id)).collect::<Vec<_>>();
 
                 let serialized_new_terms = utils::serialize(&new_terms)?;
+
+                tree.insert(&id_bytes, serialized_inner)?;
 
                 let mut batch = sled::Batch::default();
 
@@ -169,6 +211,37 @@ impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store
 
             Ok(())
         })?;
+        Ok(())
+    }
+
+    pub fn delete(&self, id: u64) -> err::Result<()> {
+        self.delete_multi(&[id])
+    }
+
+    pub fn delete_multi(&self, ids: &[u64]) -> err::Result<()> {
+        [&self.tree, &self.meta].transaction(|trees| {
+            let tree = &trees[0];
+            let meta = &trees[1];
+
+            for id in ids {
+
+                let id_bytes = utils::u64_to_bytes(*id);
+
+                if let Some(serialized_prev_terms) = meta.remove(
+                    query::TERMS_PREFIX.into_iter().chain(&id_bytes).copied().collect::<Vec<_>>()
+                )? {
+                    let prev_terms: Vec<Vec<u8>> = utils::deserialize(&serialized_prev_terms)?;
+                    for term in prev_terms {
+                        meta.remove(term)?;
+                    }
+                }
+
+                tree.remove(&id_bytes)?;
+            }
+
+            Ok(())
+        })?;
+
         Ok(())
     }
 
@@ -199,6 +272,32 @@ impl<T: query::Queryable + serde::Serialize + serde::de::DeserializeOwned> Store
     pub fn filter<Q: query::Query>(&self, query: Q) -> err::Result<query::Results<T>> {
         let matching_ids = query.matching_ids(self)?;
         Ok(query::Results { matching_ids, store: self })
+    }
+
+    pub fn delete_all(&self) -> err::Result<()> {
+
+        let tree_keys = self.tree.iter().keys().collect::<Vec<_>>();
+        let meta_keys = self.meta.iter().keys().collect::<Vec<_>>();
+
+        [&self.tree, &self.meta].transaction(|trees| {
+            let tree = &trees[0];
+            let meta = &trees[1];
+
+            for key in tree_keys.clone() {
+                let key = key?;
+                tree.remove(key)?;
+            }
+
+            for key in meta_keys.clone() {
+                let key = key?;
+                meta.remove(key)?;
+            }
+
+
+            Ok(())
+        })?;
+
+        Ok(())
     }
 
 }

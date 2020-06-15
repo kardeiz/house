@@ -32,8 +32,16 @@ fn main() {
 
     let id = store.create(&book).unwrap();
 
+    println!("{:?}", store.find(id).unwrap());
+
+    let mut book = house::Object { id, inner: book };
+
+    book.title = "The Greatest".into();
+
+    store.update(&book).unwrap();
+
     let found_books = store
-        .filter(house::query::StrEquals("title", "The Great Gatsby"))
+        .filter(house::query::StrEquals("title", "The Greatest"))
         .unwrap()
         .first()
         .unwrap();
